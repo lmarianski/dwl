@@ -79,7 +79,7 @@ static const char *menucmd[] = { "bemenu-run", NULL };
 static const char scratchpadname[] = "scratchpad";
 static const char *scratchpadcmd[] = { "alacritty", "-t", scratchpadname, NULL };
 
-#include <X11/XF86keysym.h>
+// #include "shiftview.c"
 
 static const Key keys[] = {
 	/* Note that Shift changes certain key codes: c -> C, 2 -> at, etc. */
@@ -89,12 +89,14 @@ static const Key keys[] = {
 //	{ MODKEY,                    XKB_KEY_grave,      togglescratch,  {.v = scratchpadcmd } },
 	{ MODKEY,                    XKB_KEY_j,          focusstack,     {.i = +1} },
 	{ MODKEY,                    XKB_KEY_k,          focusstack,     {.i = -1} },
-	{ MODKEY,                    XKB_KEY_i,          incnmaster,     {.i = +1} },
-	{ MODKEY,                    XKB_KEY_d,          incnmaster,     {.i = -1} },
+	// { MODKEY,                    XKB_KEY_i,          incnmaster,     {.i = +1} },
+	// { MODKEY,                    XKB_KEY_d,          incnmaster,     {.i = -1} },
 	{ MODKEY,                    XKB_KEY_h,          setmfact,       {.f = -0.05} },
 	{ MODKEY,                    XKB_KEY_l,          setmfact,       {.f = +0.05} },
 	{ MODKEY,                    XKB_KEY_Return,     zoom,           {0} },
 	{ MODKEY,                    XKB_KEY_Tab,        view,           {0} },
+//	{ MODKEY,                    XKB_KEY_a,          shiftview,      { .i = -1 } },
+//	{ MODKEY,                    XKB_KEY_semicolon,  shiftview,      { .i = 1 } },
 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_C,          killclient,     {0} },
 	{ MODKEY,                    XKB_KEY_t,          setlayout,      {.v = &layouts[0]} },
 	{ MODKEY,                    XKB_KEY_f,          setlayout,      {.v = &layouts[1]} },
@@ -120,22 +122,22 @@ static const Key keys[] = {
 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Q,          quit,           {0} },
 
 	/* MEDIA */
-	{ 0,                         XF86XK_AudioMute,   spawn,          {.v = mutevol } },
-	{ 0,                         XF86XK_AudioLowerVolume,  spawn,    VOLCTRL("-5%") },
-	{ 0,                         XF86XK_AudioRaiseVolume,  spawn,    VOLCTRL("+5%") },
-	{ WLR_MODIFIER_SHIFT,        XF86XK_AudioLowerVolume,  spawn,    VOLCTRL("-1%") },
-	{ WLR_MODIFIER_SHIFT,        XF86XK_AudioRaiseVolume,  spawn,    VOLCTRL("+1%") },
+	{ 0,                         XKB_KEY_XF86AudioMute,   spawn,          {.v = mutevol } },
+	{ 0,                         XKB_KEY_XF86AudioLowerVolume,  spawn,    VOLCTRL("-5%") },
+	{ 0,                         XKB_KEY_XF86AudioRaiseVolume,  spawn,    VOLCTRL("+5%") },
+	{ WLR_MODIFIER_SHIFT,        XKB_KEY_XF86AudioLowerVolume,  spawn,    VOLCTRL("-1%") },
+	{ WLR_MODIFIER_SHIFT,        XKB_KEY_XF86AudioRaiseVolume,  spawn,    VOLCTRL("+1%") },
 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_F1,               spawn,    AUDIOCTRL("previous") },
 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_F2,               spawn,    AUDIOCTRL("next") },
 	// { MODKEY,                 XK_Escape,                spawn,    AUDIOCTRL("play-pause") },
 	{ MODKEY,                    XKB_KEY_Escape,           spawn,    SHCMD("~/scripts/media-toggle.sh") },
 	/* FN */
 	{ MODKEY,                    XKB_KEY_l,                spawn,    SHCMD("xautolock -locknow") },
-	{ 0,                         XF86XK_MonBrightnessDown, spawn,    BRGCTRL("10%-") },
-	{ WLR_MODIFIER_SHIFT,        XF86XK_MonBrightnessDown, spawn,    BRGCTRL("5%-") },
-	{ 0,                         XF86XK_MonBrightnessUp,   spawn,    BRGCTRL("+10%") },
-	{ WLR_MODIFIER_SHIFT,        XF86XK_MonBrightnessUp,   spawn,    BRGCTRL("+5%") },
-	{ 0,                         XF86XK_Calculator,        spawn,    SHCMD("$CALCULATOR") },
+	{ 0,                         XKB_KEY_XF86MonBrightnessDown, spawn,    BRGCTRL("10%-") },
+	{ WLR_MODIFIER_SHIFT,        XKB_KEY_XF86MonBrightnessDown, spawn,    BRGCTRL("5%-") },
+	{ 0,                         XKB_KEY_XF86MonBrightnessUp,   spawn,    BRGCTRL("+10%") },
+	{ WLR_MODIFIER_SHIFT,        XKB_KEY_XF86MonBrightnessUp,   spawn,    BRGCTRL("+5%") },
+	{ 0,                         XKB_KEY_XF86Calculator,        spawn,    SHCMD("$CALCULATOR") },
 
 	/* Ctrl-Alt-Backspace and Ctrl-Alt-Fx used to be handled by X server */
 	{ WLR_MODIFIER_CTRL|WLR_MODIFIER_ALT,XKB_KEY_Terminate_Server, quit, {0} },
