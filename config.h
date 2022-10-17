@@ -5,6 +5,8 @@ static const int lockfullscreen     = 1;  /* 1 will force focus on the fullscree
 static const float rootcolor[]      = {0.3, 0.3, 0.3, 1.0};
 static const float bordercolor[]    = {0.5, 0.5, 0.5, 1.0};
 static const float focuscolor[]     = {1.0, 0.0, 0.0, 1.0};
+/* To conform the xdg-protocol, set the alpha to zero to restore the old behavior */
+static const float fullscreen_bg[]  = {0.1, 0.1, 0.1, 1.0};
 
 /* tagging */
 static const char *tags[] = { "1", "2", "3", "4", "5", "6", "7", "8", "9" };
@@ -50,7 +52,40 @@ static const int repeat_delay = 600;
 
 /* Trackpad */
 static const int tap_to_click = 1;
+static const int tap_and_drag = 1;
+static const int drag_lock = 1;
 static const int natural_scrolling = 0;
+static const int disable_while_typing = 1;
+static const int left_handed = 0;
+static const int middle_button_emulation = 0;
+/* You can choose between:
+LIBINPUT_CONFIG_SCROLL_NO_SCROLL
+LIBINPUT_CONFIG_SCROLL_2FG
+LIBINPUT_CONFIG_SCROLL_EDGE
+LIBINPUT_CONFIG_SCROLL_ON_BUTTON_DOWN
+*/
+static const enum libinput_config_scroll_method scroll_method = LIBINPUT_CONFIG_SCROLL_2FG;
+
+/* You can choose between:
+LIBINPUT_CONFIG_CLICK_METHOD_NONE
+LIBINPUT_CONFIG_CLICK_METHOD_BUTTON_AREAS
+LIBINPUT_CONFIG_CLICK_METHOD_CLICKFINGER
+*/
+static const enum libinput_config_click_method click_method = LIBINPUT_CONFIG_CLICK_METHOD_BUTTON_AREAS;
+
+/* You can choose between:
+LIBINPUT_CONFIG_SEND_EVENTS_ENABLED
+LIBINPUT_CONFIG_SEND_EVENTS_DISABLED
+LIBINPUT_CONFIG_SEND_EVENTS_DISABLED_ON_EXTERNAL_MOUSE
+*/
+static const uint32_t send_events_mode = LIBINPUT_CONFIG_SEND_EVENTS_ENABLED;
+
+/* You can choose between:
+LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT
+LIBINPUT_CONFIG_ACCEL_PROFILE_ADAPTIVE
+*/
+static const enum libinput_config_accel_profile accel_profile = LIBINPUT_CONFIG_ACCEL_PROFILE_FLAT;
+static const double accel_speed = 0.0;
 
 /* If you want to use the windows key change this to WLR_MODIFIER_LOGO */
 #define MODKEY WLR_MODIFIER_LOGO
@@ -138,6 +173,8 @@ static const Key keys[] = {
 	{ 0,                         XKB_KEY_XF86MonBrightnessUp,   spawn,    BRGCTRL("+10%") },
 	{ WLR_MODIFIER_SHIFT,        XKB_KEY_XF86MonBrightnessUp,   spawn,    BRGCTRL("+5%") },
 	{ 0,                         XKB_KEY_XF86Calculator,        spawn,    SHCMD("$CALCULATOR") },
+
+	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_S,                spawn,    SHCMD("~/scripts/screenshot.sh") },
 
 	/* Ctrl-Alt-Backspace and Ctrl-Alt-Fx used to be handled by X server */
 	{ WLR_MODIFIER_CTRL|WLR_MODIFIER_ALT,XKB_KEY_Terminate_Server, quit, {0} },

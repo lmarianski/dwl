@@ -1,6 +1,6 @@
 # Maintainer: Devin J. Pohly <djpohly+arch@gmail.com>
 pkgname=dwl-git
-pkgver=0.3.1.r0.b86fcf6
+pkgver=0.3.1.r139.e9826de
 pkgrel=1
 pkgdesc="Simple, hackable dynamic tiling Wayland compositor (dwm for Wayland)"
 arch=('x86_64')
@@ -12,14 +12,16 @@ optdepends=('xorg-xwayland: for XWayland support')
 provides=("${pkgname%-git}")
 conflicts=("${pkgname%-git}")
 # append #branch=wlroots-next to build against wlvroots-git
-source=('git+https://github.com/djpohly/dwl#tag=v0.3.1'
+source=('git+https://github.com/djpohly/dwl'
 	'shiftview.patch::https://github.com/djpohly/dwl/compare/main...guidocella:shiftview.patch'
 	'swaycompat.patch::https://raw.githubusercontent.com/StratusFearMe21/dwl/main/0001-For-patching.patch'
+	'https://github.com/djpohly/dwl/compare/main...guidocella:output-power-management.patch'
 	'dwl-scratchpad.patch'
 )
 sha256sums=('SKIP'
             '9d2b6e8ae8f172ab6e910856c05a051e2bec871708bcf36fbce62014854b53fb'
             '7759a53f011f8ca8f4ec210d1b2aacf5cd6b6531ec45d7280e2f2f1c30ca6e87'
+            '020e5fb360281aee3a63915049814dc6cd457b79e743f902afca775611722b6a'
             'd566b2a8a531a0cc826c7e8b2407db22cd45f4b9ee903530371f947c5813775e')
 
 prepare() {
@@ -27,6 +29,7 @@ prepare() {
 
 	# Uncomment to compile with XWayland support
 	sed -i -e '/-DXWAYLAND/s/^#//' config.mk
+	sed -i -e '/xcb/s/^#//' config.mk
 
 	patch -p1 -t --input "$srcdir/shiftview.patch"
 	# patch -p1 --input "$srcdir/swaycompat.patch" --merge
