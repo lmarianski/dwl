@@ -9,8 +9,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/wait.h>
+#include <sys/un.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
 #include <time.h>
+#include <ctype.h>
+#include <strings.h>
 #include <unistd.h>
+#include <json.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/backend/libinput.h>
@@ -54,6 +61,8 @@
 #endif
 
 #include "util.h"
+#include "list.h"
+#include "stringop.h"
 
 /* macros */
 #define MAX(A, B)               ((A) > (B) ? (A) : (B))
@@ -202,7 +211,83 @@ typedef struct {
 	int monitor;
 } Rule;
 
+#define event_mask(ev) (1 << (ev & 0x7F))
+
+enum ipc_command_type {
+	// i3 command types - see i3's I3_REPLY_TYPE constants
+	IPC_COMMAND = 0,
+	IPC_GET_WORKSPACES = 1,
+	IPC_SUBSCRIBE = 2,
+	IPC_GET_OUTPUTS = 3,
+	IPC_GET_TREE = 4,
+	IPC_GET_MARKS = 5,
+	IPC_GET_BAR_CONFIG = 6,
+	IPC_GET_VERSION = 7,
+	IPC_GET_BINDING_MODES = 8,
+	IPC_GET_CONFIG = 9,
+	IPC_SEND_TICK = 10,
+	IPC_SYNC = 11,
+	IPC_GET_BINDING_STATE = 12,
+
+	// sway-specific command types
+	IPC_GET_INPUTS = 100,
+	IPC_GET_SEATS = 101,
+
+	// Events sent from sway to clients. Events have the highest bits set.
+	IPC_EVENT_WORKSPACE = (int)((1u<<31) | 0),
+	IPC_EVENT_OUTPUT = (int)((1u<<31) | 1),
+	IPC_EVENT_MODE = (int)((1u<<31) | 2),
+	IPC_EVENT_WINDOW = (int)((1u<<31) | 3),
+	IPC_EVENT_BARCONFIG_UPDATE = (int)((1u<<31) | 4),
+	IPC_EVENT_BINDING = (int)((1u<<31) | 5),
+	IPC_EVENT_SHUTDOWN = (int)((1u<<31) | 6),
+	IPC_EVENT_TICK = (int)((1u<<31) | 7),
+
+	// sway-specific event types
+	IPC_EVENT_BAR_STATE_UPDATE = (int)((1u<<31) | 20),
+	IPC_EVENT_INPUT = (int)((1u<<31) | 21),
+};
+
+enum node_type { N_ROOT, N_OUTPUT, N_WORKSPACE, N_CONTAINER };
+
+static int ipc_socket = -1;
+static struct wl_event_source *ipc_event_source =  NULL;
+static struct sockaddr_un *ipc_sockaddr = NULL;
+static list_t *ipc_client_list = NULL;
+static ssize_t i3_tag = 0;
+static struct wl_listener ipc_display_destroy;
+
+static const char ipc_magic[] = {'i', '3', '-', 'i', 'p', 'c'};
+
+#define IPC_HEADER_SIZE (sizeof(ipc_magic) + 8)
+
+struct ipc_client {
+	struct wl_event_source *event_source;
+	struct wl_event_source *writable_event_source;
+	int fd;
+	enum ipc_command_type subscribed_events;
+	size_t write_buffer_len;
+	size_t write_buffer_size;
+	char *write_buffer;
+	// The following are for storing data between event_loop calls
+	uint32_t pending_length;
+	enum ipc_command_type pending_type;
+};
+
+int ipc_handle_connection(int fd, uint32_t mask, void *data);
+int ipc_client_handle_readable(int client_fd, uint32_t mask, void *data);
+void ipc_client_handle_command(struct ipc_client *client, uint32_t payload_length,
+	enum ipc_command_type payload_type);
+bool ipc_send_reply(struct ipc_client *client, enum ipc_command_type payload_type,
+	const char *payload, uint32_t payload_length);
+/*
+int ipc_client_handle_writable(int client_fd, uint32_t mask, void *data);
+void ipc_client_disconnect(struct ipc_client *client);
+*/
+
 /* function declarations */
+static void ipc_event_window(Client *window, const char *change);
+static void ipc_event_shutdown(const char *reason);
 static void applybounds(Client *c, struct wlr_box *bbox);
 static void applyexclusive(struct wlr_box *usable_area, uint32_t anchor,
 		int32_t exclusive, int32_t margin_top, int32_t margin_right,
@@ -290,6 +375,7 @@ static void updatemons(struct wl_listener *listener, void *data);
 static void updatetitle(struct wl_listener *listener, void *data);
 static void urgent(struct wl_listener *listener, void *data);
 static void view(const Arg *arg);
+static void viewall(const Arg *arg);
 static void virtualkeyboard(struct wl_listener *listener, void *data);
 static Monitor *xytomon(double x, double y);
 static struct wlr_scene_node *xytonode(double x, double y, struct wlr_surface **psurface,
@@ -376,6 +462,9 @@ static Atom netatom[NetLast];
 
 /* attempt to encapsulate suck into one file */
 #include "client.h"
+
+/* i3 commands compatibility layer */
+#include "commands.c"
 
 /* compile-time check if all tags fit into an unsigned int bit array. */
 struct NumTags { char limitexceeded[LENGTH(tags) > 31 ? -1 : 1]; };
@@ -1141,6 +1230,7 @@ destroynotify(struct wl_listener *listener, void *data)
 		wl_list_remove(&c->activate.link);
 	}
 #endif
+	ipc_event_window(c, "close");
 	free(c);
 }
 
@@ -1211,6 +1301,7 @@ focusclient(Client *c, int lift)
 		}
 	}
 
+	ipc_event_window(c, "focus");
 	printstatus();
 	checkidleinhibitor(NULL);
 
@@ -1480,6 +1571,7 @@ mapnotify(struct wl_listener *listener, void *data)
 	} else {
 		applyrules(c);
 	}
+	ipc_event_window(c, "new");
 	printstatus();
 
 	c->mon->un_map = 1;
@@ -1767,6 +1859,42 @@ printstatus(void)
 				sel, urg);
 		printf("%s layout %s\n", m->wlr_output->name, m->lt[m->sellt]->symbol);
 	}
+	fflush(stdout);
+}
+
+void ipc_client_disconnect(struct ipc_client *client) {
+	int i = 0;
+
+	shutdown(client->fd, SHUT_RDWR);
+
+	wl_event_source_remove(client->event_source);
+	if (client->writable_event_source) {
+		wl_event_source_remove(client->writable_event_source);
+	}
+	while (i < ipc_client_list->length && ipc_client_list->items[i] != client) {
+		i++;
+	}
+	list_del(ipc_client_list, i);
+	free(client->write_buffer);
+	close(client->fd);
+	free(client);
+}
+
+static void handle_display_destroy(struct wl_listener *listener, void *data) {
+	if (ipc_event_source) {
+		wl_event_source_remove(ipc_event_source);
+	}
+	close(ipc_socket);
+	unlink(ipc_sockaddr->sun_path);
+
+	while (ipc_client_list->length) {
+		ipc_client_disconnect(ipc_client_list->items[ipc_client_list->length-1]);
+	}
+	list_free(ipc_client_list);
+
+	free(ipc_sockaddr);
+
+	wl_list_remove(&ipc_display_destroy.link);
 }
 
 void
@@ -1851,6 +1979,879 @@ resize(Client *c, struct wlr_box geo, int interact)
 			c->geom.height - 2 * c->bw);
 }
 
+static bool ipc_has_event_listeners(enum ipc_command_type event) {
+	for (int i = 0; i < ipc_client_list->length; i++) {
+		struct ipc_client *client = ipc_client_list->items[i];
+		if ((client->subscribed_events & event_mask(event)) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void ipc_send_event(const char *json_string, enum ipc_command_type event) {
+	struct ipc_client *client;
+	for (int i = 0; i < ipc_client_list->length; i++) {
+		client = ipc_client_list->items[i];
+		if ((client->subscribed_events & event_mask(event)) == 0) {
+			continue;
+		}
+		if (!ipc_send_reply(client, event, json_string,
+				(uint32_t)strlen(json_string))) {
+			fprintf(stderr, "Unable to send reply to IPC client");
+			/* ipc_send_reply destroys client on error, which also
+			 * removes it from the list, so we need to process
+			 * current index again */
+			i--;
+		}
+	}
+}
+
+static void ipc_event_tick(const char *payload) {
+	json_object *json;
+	const char *json_string;
+	if (!ipc_has_event_listeners(IPC_EVENT_TICK)) {
+		return;
+	}
+
+	json = json_object_new_object();
+	json_object_object_add(json, "first", json_object_new_boolean(false));
+	json_object_object_add(json, "payload", json_object_new_string(payload));
+
+	json_string = json_object_to_json_string(json);
+	ipc_send_event(json_string, IPC_EVENT_TICK);
+	json_object_put(json);
+}
+
+struct sockaddr_un *ipc_user_sockaddr(void) {
+	int path_size;
+	struct sockaddr_un *ipc_sockaddr = malloc(sizeof(struct sockaddr_un));
+	// Env var typically set by logind, e.g. "/run/user/<user-id>"
+	const char *dir = getenv("XDG_RUNTIME_DIR");
+
+	if (ipc_sockaddr == NULL) {
+		die("Can't allocate ipc_sockaddr");
+	}
+
+	ipc_sockaddr->sun_family = AF_UNIX;
+	path_size = sizeof(ipc_sockaddr->sun_path);
+
+	if (!dir) {
+		dir = "/tmp";
+	}
+	if (path_size <= snprintf(ipc_sockaddr->sun_path, path_size,
+			"%s/sway-ipc.%u.%i.sock", dir, getuid(), getpid())) {
+		die("Socket path won't fit into ipc_sockaddr->sun_path");
+	}
+
+	return ipc_sockaddr;
+}
+
+int ipc_client_handle_writable(int client_fd, uint32_t mask, void *data) {
+	ssize_t written;
+	struct ipc_client *client = data;
+
+	if (mask & WL_EVENT_ERROR) {
+		fprintf(stderr, "IPC Client socket error, removing client");
+		ipc_client_disconnect(client);
+		return 0;
+	}
+
+	if (mask & WL_EVENT_HANGUP) {
+		ipc_client_disconnect(client);
+		return 0;
+	}
+
+	if (client->write_buffer_len <= 0) {
+		return 0;
+	}
+
+	written = write(client->fd, client->write_buffer, client->write_buffer_len);
+
+	if (written == -1 && errno == EAGAIN) {
+		return 0;
+	} else if (written == -1) {
+		fprintf(stderr, "Unable to send data from queue to IPC client");
+		ipc_client_disconnect(client);
+		return 0;
+	}
+
+	memmove(client->write_buffer, client->write_buffer + written, client->write_buffer_len - written);
+	client->write_buffer_len -= written;
+
+	if (client->write_buffer_len == 0 && client->writable_event_source) {
+		wl_event_source_remove(client->writable_event_source);
+		client->writable_event_source = NULL;
+	}
+
+	return 0;
+}
+
+static const char *ipc_json_output_transform_description(enum wl_output_transform transform) {
+	switch (transform) {
+	case WL_OUTPUT_TRANSFORM_NORMAL:
+		return "normal";
+	case WL_OUTPUT_TRANSFORM_90:
+		// Sway uses clockwise transforms, while WL_OUTPUT_TRANSFORM_* describes
+		// anti-clockwise transforms.
+		return "270";
+	case WL_OUTPUT_TRANSFORM_180:
+		return "180";
+	case WL_OUTPUT_TRANSFORM_270:
+		// Transform also inverted here.
+		return "90";
+	case WL_OUTPUT_TRANSFORM_FLIPPED:
+		return "flipped";
+	case WL_OUTPUT_TRANSFORM_FLIPPED_90:
+		// Inverted.
+		return "flipped-270";
+	case WL_OUTPUT_TRANSFORM_FLIPPED_180:
+		return "flipped-180";
+	case WL_OUTPUT_TRANSFORM_FLIPPED_270:
+		// Inverted.
+		return "flipped-90";
+	}
+	return NULL;
+}
+
+
+static const char *ipc_json_output_adaptive_sync_status_description(
+		enum wlr_output_adaptive_sync_status status) {
+	switch (status) {
+	case WLR_OUTPUT_ADAPTIVE_SYNC_DISABLED:
+		return "disabled";
+	case WLR_OUTPUT_ADAPTIVE_SYNC_ENABLED:
+		return "enabled";
+	case WLR_OUTPUT_ADAPTIVE_SYNC_UNKNOWN:
+		return "unknown";
+	}
+	return NULL;
+}
+
+static json_object *ipc_json_create_rect(struct wlr_box *box) {
+	json_object *rect = json_object_new_object();
+
+	json_object_object_add(rect, "x", json_object_new_int(box->x));
+	json_object_object_add(rect, "y", json_object_new_int(box->y));
+	json_object_object_add(rect, "width", json_object_new_int(box->width));
+	json_object_object_add(rect, "height", json_object_new_int(box->height));
+
+	return rect;
+}
+
+static json_object *ipc_json_create_empty_rect(void) {
+	struct wlr_box empty = {0, 0, 0, 0};
+
+	return ipc_json_create_rect(&empty);
+}
+
+static json_object *ipc_json_create_node(intptr_t id, const char* type, const char *name,
+		bool focused, struct wlr_box *box) {
+	json_object *object = json_object_new_object();
+
+	json_object_object_add(object, "id", json_object_new_int(abs(id)));
+	json_object_object_add(object, "type", json_object_new_string(type));
+	json_object_object_add(object, "orientation",
+			json_object_new_string("none"));
+	json_object_object_add(object, "percent", NULL);
+	json_object_object_add(object, "urgent", json_object_new_boolean(false));
+	json_object_object_add(object, "marks", json_object_new_array());
+	json_object_object_add(object, "focused", json_object_new_boolean(focused));
+	json_object_object_add(object, "layout",
+			json_object_new_string("splith"));
+
+	// set default values to be compatible with i3
+	json_object_object_add(object, "border",
+			json_object_new_string("none"));
+	json_object_object_add(object, "current_border_width",
+			json_object_new_int(0));
+	json_object_object_add(object, "rect", ipc_json_create_rect(box));
+	json_object_object_add(object, "deco_rect", ipc_json_create_empty_rect());
+	json_object_object_add(object, "window_rect", ipc_json_create_empty_rect());
+	json_object_object_add(object, "geometry", ipc_json_create_empty_rect());
+	json_object_object_add(object, "name",
+			name ? json_object_new_string(name) : NULL);
+	json_object_object_add(object, "window", NULL);
+	json_object_object_add(object, "nodes", json_object_new_array());
+	json_object_object_add(object, "floating_nodes", json_object_new_array());
+	json_object_object_add(object, "focus", json_object_new_array());
+	json_object_object_add(object, "fullscreen_mode", json_object_new_int(0));
+	json_object_object_add(object, "sticky", json_object_new_boolean(false));
+
+	return object;
+}
+
+json_object* ipc_json_describe_client(Client *c) {
+	json_object *object;
+	bool visible;
+	Monitor *tempm;
+	struct wlr_box deco_box = {c->geom.x-borderpx, c->geom.y-borderpx, c->geom.width + borderpx, c->geom.height + borderpx};
+	object = ipc_json_create_node((intptr_t)c, "con", client_get_title(c), seat->keyboard_state.focused_surface == client_surface(c), &c->geom);
+	if (c->isfloating) {
+		json_object_object_add(object, "type",
+				json_object_new_string("floating_con"));
+	}
+
+	json_object_object_add(object, "layout",
+			json_object_new_string("none"));
+
+	json_object_object_add(object, "orientation",
+			json_object_new_string("none"));
+
+	json_object_object_add(object, "urgent", json_object_new_boolean(c->isurgent));
+
+	json_object_object_add(object, "fullscreen_mode",
+			json_object_new_int(c->isfullscreen));
+
+	if (deco_box.width != 0 && deco_box.height != 0) {
+		double percent = ((double)c->geom.width / deco_box.width)
+				* ((double)c->geom.height / deco_box.height);
+		json_object_object_add(object, "percent", json_object_new_double(percent));
+	}
+
+	json_object_object_add(object, "border",
+			json_object_new_string("pixel"));
+	json_object_object_add(object, "current_border_width",
+			json_object_new_int(borderpx));
+	json_object_object_add(object, "floating_nodes", json_object_new_array());
+
+	json_object_object_add(object, "deco_rect", ipc_json_create_rect(&deco_box));
+
+	/*
+	json_object *marks = json_object_new_array();
+	list_t *con_marks = c->marks;
+	for (int i = 0; i < con_marks->length; ++i) {
+		json_object_array_add(marks, json_object_new_string(con_marks->items[i]));
+	}
+
+	json_object_object_add(object, "marks", marks);
+	*/
+
+	// json_object_object_add(object, "pid", json_object_new_int(client_get_pid(c)));
+
+	const char *app_id = client_get_appid(c);
+	json_object_object_add(object, "app_id",
+			app_id ? json_object_new_string(app_id) : NULL);
+
+	wl_list_for_each(tempm, &mons, link) {
+		if (VISIBLEON(c, tempm)) {
+			visible = true;
+		}
+	}
+	json_object_object_add(object, "visible", json_object_new_boolean(visible));
+
+	json_object_object_add(object, "window_rect", ipc_json_create_rect(&c->geom));
+
+	json_object_object_add(object, "geometry", ipc_json_create_rect(&c->geom));
+
+	json_object_object_add(object, "max_render_time", json_object_new_int(0));
+
+	/*
+	json_object_object_add(object, "shell", json_object_new_string(view_get_shell(c->view)));
+
+	json_object_object_add(object, "inhibit_idle",
+		json_object_new_boolean(view_inhibit_idle(c->view)));
+
+	json_object *idle_inhibitors = json_object_new_object();
+
+	struct sway_idle_inhibitor_v1 *user_inhibitor =
+		sway_idle_inhibit_v1_user_inhibitor_for_view(c->view);
+
+	if (user_inhibitor) {
+		json_object_object_add(idle_inhibitors, "user",
+			json_object_new_string(
+				ipc_json_user_idle_inhibitor_description(user_inhibitor->mode)));
+	} else {
+		json_object_object_add(idle_inhibitors, "user",
+			json_object_new_string("none"));
+	}
+
+	struct sway_idle_inhibitor_v1 *application_inhibitor =
+		sway_idle_inhibit_v1_application_inhibitor_for_view(c->view);
+
+	if (application_inhibitor) {
+		json_object_object_add(idle_inhibitors, "application",
+			json_object_new_string("enabled"));
+	} else {
+		json_object_object_add(idle_inhibitors, "application",
+			json_object_new_string("none"));
+	}
+
+	json_object_object_add(object, "idle_inhibitors", idle_inhibitors);
+
+#if XWAYLAND
+	if (c->view->type == SWAY_VIEW_XWAYLAND) {
+		json_object_object_add(object, "window",
+				json_object_new_int(view_get_x11_window_id(c->view)));
+
+		json_object *window_props = json_object_new_object();
+
+		const char *class = view_get_class(c->view);
+		if (class) {
+			json_object_object_add(window_props, "class", json_object_new_string(class));
+		}
+		const char *instance = view_get_instance(c->view);
+		if (instance) {
+			json_object_object_add(window_props, "instance", json_object_new_string(instance));
+		}
+		if (c->title) {
+			json_object_object_add(window_props, "title", json_object_new_string(c->title));
+		}
+
+		// the transient_for key is always present in i3's output
+		uint32_t parent_id = view_get_x11_parent_id(c->view);
+		json_object_object_add(window_props, "transient_for",
+				parent_id ? json_object_new_int(parent_id) : NULL);
+
+		const char *role = view_get_window_role(c->view);
+		if (role) {
+			json_object_object_add(window_props, "window_role", json_object_new_string(role));
+		}
+
+		uint32_t window_type = view_get_window_type(c->view);
+		if (window_type) {
+			json_object_object_add(window_props, "window_type",
+				json_object_new_string(
+					ipc_json_xwindow_type_description(c->view)));
+		}
+
+		json_object_object_add(object, "window_properties", window_props);
+	}
+#endif
+	*/
+	return object;
+}
+
+void ipc_event_shutdown(const char *reason) {
+	json_object *json;
+	const char *json_string;
+	if (!ipc_has_event_listeners(IPC_EVENT_SHUTDOWN)) {
+		return;
+	}
+
+	json = json_object_new_object();
+	json_object_object_add(json, "change", json_object_new_string(reason));
+
+	json_string = json_object_to_json_string(json);
+	ipc_send_event(json_string, IPC_EVENT_SHUTDOWN);
+	json_object_put(json);
+}
+
+void ipc_event_window(Client *window, const char *change) {
+	json_object *obj;
+	const char *json_string; 
+	if (!ipc_has_event_listeners(IPC_EVENT_WINDOW) || window == NULL) {
+		return;
+	}
+	obj = json_object_new_object();
+	json_object_object_add(obj, "change", json_object_new_string(change));
+	json_object_object_add(obj, "container", ipc_json_describe_client(window));
+
+	json_string = json_object_to_json_string(obj);
+	ipc_send_event(json_string, IPC_EVENT_WINDOW);
+	json_object_put(obj);
+}
+
+json_object* ipc_get_workspaces_callback(ssize_t i, Monitor *m) {
+	Monitor *tempm;
+	Client *c;
+	bool visible = false;
+	json_object *children = json_object_new_array();
+	json_object *workspace_json = ipc_json_create_node((intptr_t)m, "workspace", tags[i], (1 << i) & selmon->tagset[selmon->seltags], &m->w);
+
+	wl_list_for_each(tempm, &mons, link) {
+		if ((1 << i) & tempm->tagset[tempm->seltags]) {
+			visible = true;
+		}
+	}
+
+
+	json_object_object_add(workspace_json, "num", json_object_new_int(i + 1));
+	json_object_object_add(workspace_json, "fullscreen_mode", json_object_new_int(1));
+	json_object_object_add(workspace_json, "representation", json_object_new_string("D[]"));
+	json_object_object_add(workspace_json, "visible", json_object_new_boolean(visible));
+	json_object_object_add(workspace_json, "output", json_object_new_string(selmon->wlr_output->name));
+	wl_list_for_each(c, &clients, link) {
+		if (c->tags == (1 << i)) {
+			json_object_array_add(children, ipc_json_describe_client(c));
+		}
+	}
+	json_object_object_add(workspace_json, "nodes", children);
+	return workspace_json;
+}
+
+json_object* ipc_json_describe_output(Monitor *m) {
+	json_object *object = ipc_json_create_node((intptr_t)m, "output", m->wlr_output->name, false, &m->w);
+	struct wlr_output *wlr_output = m->wlr_output;
+	struct wlr_output_mode *mode;
+	ssize_t i;
+	const char *adaptive_sync_status;
+	json_object *modes_array = json_object_new_array();
+	json_object *children = json_object_new_array();
+	json_object *current_mode_object = json_object_new_object();
+
+	json_object_object_add(object, "primary", json_object_new_boolean(false));
+	json_object_object_add(object, "make",
+			json_object_new_string(wlr_output->make));
+	json_object_object_add(object, "model",
+			json_object_new_string(wlr_output->model));
+	json_object_object_add(object, "serial",
+			json_object_new_string(wlr_output->serial));
+
+	wl_list_for_each(mode, &wlr_output->modes, link) {
+		json_object *mode_object = json_object_new_object();
+		json_object_object_add(mode_object, "width",
+			json_object_new_int(mode->width));
+		json_object_object_add(mode_object, "height",
+			json_object_new_int(mode->height));
+		json_object_object_add(mode_object, "refresh",
+			json_object_new_int(mode->refresh));
+		json_object_array_add(modes_array, mode_object);
+	}
+	json_object_object_add(object, "modes", modes_array);
+	json_object_object_add(object, "active", json_object_new_boolean(true));
+	json_object_object_add(object, "dpms",
+			json_object_new_boolean(wlr_output->enabled));
+	json_object_object_add(object, "layout", json_object_new_string("output"));
+	json_object_object_add(object, "orientation",
+			json_object_new_string("none"));
+	json_object_object_add(object, "scale",
+			json_object_new_double(wlr_output->scale));
+	/*
+	json_object_object_add(object, "scale_filter",
+		json_object_new_string(
+			sway_output_scale_filter_to_string(output->scale_filter)));
+	*/
+	json_object_object_add(object, "transform",
+		json_object_new_string(
+			ipc_json_output_transform_description(wlr_output->transform)));
+	adaptive_sync_status =
+		ipc_json_output_adaptive_sync_status_description(
+			wlr_output->adaptive_sync_status);
+	json_object_object_add(object, "adaptive_sync_status",
+		json_object_new_string(adaptive_sync_status));
+
+
+	for (i = 0; i < LENGTH(tags); i++) {
+		if ((1 << i) & m->tagset[m->seltags]) {
+	json_object_object_add(object, "current_workspace",
+			json_object_new_string(tags[i]));
+			break;
+		}
+	}
+
+	json_object_object_add(current_mode_object, "width",
+		json_object_new_int(wlr_output->width));
+	json_object_object_add(current_mode_object, "height",
+		json_object_new_int(wlr_output->height));
+	json_object_object_add(current_mode_object, "refresh",
+		json_object_new_int(wlr_output->refresh));
+	json_object_object_add(object, "current_mode", current_mode_object);
+
+	if (m->m.width != 0 && m->m.height != 0) {
+		double percent = ((double)m->w.width / m->m.width)
+				* ((double)m->w.height / m->m.height);
+		json_object_object_add(object, "percent", json_object_new_double(percent));
+	}
+
+	for (i = 0; i < LENGTH(tags); i++) {
+		json_object_array_add(children, ipc_get_workspaces_callback(i, m));
+	}
+	json_object_object_add(object, "nodes", children);
+
+	return object;
+}
+
+json_object* ipc_json_node_tree(void) {
+	Monitor *tempm;
+	json_object *full_obj;
+	json_object* children = json_object_new_array();
+	struct wlr_box full_box = {0, 0, 0, 0};
+	wl_list_for_each(tempm, &mons, link) {
+		if (tempm->m.x < full_box.x) {
+			full_box.x = tempm->m.x;
+		}
+		if (tempm->m.y < full_box.y) {
+			full_box.y = tempm->m.y;
+		}
+		if (tempm->m.x + tempm->m.width > full_box.width) {
+			full_box.width = tempm->m.x + tempm->m.width;
+		}
+		if (tempm->m.y + tempm->m.height > full_box.height) {
+			full_box.height = tempm->m.y + tempm->m.height;
+		}
+	}
+	full_box.width = full_box.width - full_box.x;
+	full_box.height = full_box.height - full_box.y;
+	full_obj = ipc_json_create_node(1, "root", "root", false, &full_box);
+	wl_list_for_each(tempm, &mons, link) {
+		json_object_array_add(children, ipc_json_describe_output(tempm));	
+	}
+	json_object_object_add(full_obj, "nodes", children);
+	return full_obj;
+}
+
+void ipc_client_handle_command(struct ipc_client *client, uint32_t payload_length,
+		enum ipc_command_type payload_type) {
+	char *buf;
+	const char msg[] = "{\"success\": true}";
+	bool is_tick;
+	list_t *res_list;
+	ssize_t i;
+	const char *json_string;
+	if (client == NULL) {
+		return;
+	}
+
+	buf = malloc(payload_length + 1);
+	if (!buf) {
+		fprintf(stderr, "Unable to allocate IPC payload");
+		ipc_client_disconnect(client);
+		return;
+	}
+	if (payload_length > 0) {
+		// Payload should be fully available
+		ssize_t received = recv(client->fd, buf, payload_length, 0);
+		if (received == -1)
+		{
+			fprintf(stderr, "Unable to receive payload from IPC client");
+			ipc_client_disconnect(client);
+			free(buf);
+			return;
+		}
+	}
+	buf[payload_length] = '\0';
+	switch (payload_type) {
+	case IPC_COMMAND:
+	{
+		char *line = strtok(buf, "\n");
+		while (line) {
+			size_t line_length = strlen(line);
+			if (line + line_length >= buf + payload_length) {
+				break;
+			}
+			line[line_length] = ';';
+			line = strtok(NULL, "\n");
+		}
+
+		res_list = execute_command(buf, NULL);
+		buf = cmd_results_to_json(res_list);
+		i = strlen(buf);
+		ipc_send_reply(client, payload_type, buf, (uint32_t)i);
+		while (res_list->length) {
+			struct cmd_results *results = res_list->items[0];
+			free_cmd_results(results);
+			list_del(res_list, 0);
+		}
+		list_free(res_list);
+		goto exit_cleanup;
+	}
+
+	case IPC_SEND_TICK:
+	{
+		ipc_event_tick(buf);
+		ipc_send_reply(client, payload_type, "{\"success\": true}", 17);
+		goto exit_cleanup;
+	}
+
+	case IPC_GET_WORKSPACES:
+	{
+		json_object *workspaces = json_object_new_array();
+		for (i = 0; i < LENGTH(tags); i++) {
+			json_object_array_add(workspaces, ipc_get_workspaces_callback(i, selmon));	
+		}
+		json_string = json_object_to_json_string(workspaces);
+		ipc_send_reply(client, payload_type, json_string,
+			(uint32_t)strlen(json_string));
+		json_object_put(workspaces); // free
+		goto exit_cleanup;
+	}
+
+	case IPC_SUBSCRIBE:
+	{
+		// TODO: Check if they're permitted to use these events
+		struct json_object *request = json_tokener_parse(buf);
+		if (request == NULL || !json_object_is_type(request, json_type_array)) {
+			const char msg[] = "{\"success\": false}";
+			ipc_send_reply(client, payload_type, msg, strlen(msg));
+			fprintf(stderr, "Failed to parse subscribe request");
+			goto exit_cleanup;
+		}
+
+		is_tick = false;
+		// parse requested event types
+		for (size_t i = 0; i < json_object_array_length(request); i++) {
+			const char *event_type = json_object_get_string(json_object_array_get_idx(request, i));
+			if (strcmp(event_type, "workspace") == 0) {
+				client->subscribed_events |= event_mask(IPC_EVENT_WORKSPACE);
+			} else if (strcmp(event_type, "barconfig_update") == 0) {
+				client->subscribed_events |= event_mask(IPC_EVENT_BARCONFIG_UPDATE);
+			} else if (strcmp(event_type, "bar_state_update") == 0) {
+				client->subscribed_events |= event_mask(IPC_EVENT_BAR_STATE_UPDATE);
+			} else if (strcmp(event_type, "mode") == 0) {
+				client->subscribed_events |= event_mask(IPC_EVENT_MODE);
+			} else if (strcmp(event_type, "shutdown") == 0) {
+				client->subscribed_events |= event_mask(IPC_EVENT_SHUTDOWN);
+			} else if (strcmp(event_type, "window") == 0) {
+				client->subscribed_events |= event_mask(IPC_EVENT_WINDOW);
+			} else if (strcmp(event_type, "binding") == 0) {
+				client->subscribed_events |= event_mask(IPC_EVENT_BINDING);
+			} else if (strcmp(event_type, "tick") == 0) {
+				client->subscribed_events |= event_mask(IPC_EVENT_TICK);
+				is_tick = true;
+			} else if (strcmp(event_type, "input") == 0) {
+				client->subscribed_events |= event_mask(IPC_EVENT_INPUT);
+			} else {
+				const char msg[] = "{\"success\": false}";
+				ipc_send_reply(client, payload_type, msg, strlen(msg));
+				json_object_put(request);
+				fprintf(stderr, "Unsupported event type in subscribe request");
+				goto exit_cleanup;
+			}
+		}
+
+		json_object_put(request);
+		ipc_send_reply(client, payload_type, msg, strlen(msg));
+		if (is_tick) {
+			const char tickmsg[] = "{\"first\": true, \"payload\": \"\"}";
+			ipc_send_reply(client, IPC_EVENT_TICK, tickmsg,
+				strlen(tickmsg));
+		}
+		goto exit_cleanup;
+	}
+
+	case IPC_GET_TREE:
+	{
+		json_object *tree = ipc_json_node_tree();
+		const char *json_string = json_object_to_json_string(tree);
+		ipc_send_reply(client, payload_type, json_string,
+			(uint32_t)strlen(json_string));
+		json_object_put(tree);
+		goto exit_cleanup;
+	}
+
+
+	default:
+		fprintf(stderr, "Unknown IPC command type %x", payload_type);
+		goto exit_cleanup;
+	}
+
+exit_cleanup:
+	free(buf);
+	return;
+}
+
+void ipc_init(void) {
+	ipc_socket = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (ipc_socket == -1) {
+		die("Unable to create IPC socket");
+	}
+	if (fcntl(ipc_socket, F_SETFD, FD_CLOEXEC) == -1) {
+		die("Unable to set CLOEXEC on IPC socket");
+	}
+	if (fcntl(ipc_socket, F_SETFL, O_NONBLOCK) == -1) {
+		die("Unable to set NONBLOCK on IPC socket");
+	}
+
+	ipc_sockaddr = ipc_user_sockaddr();
+
+	// We want to use socket name set by user, not existing socket from another sway instance.
+	if (getenv("SWAYSOCK") != NULL && access(getenv("SWAYSOCK"), F_OK) == -1) {
+		strncpy(ipc_sockaddr->sun_path, getenv("SWAYSOCK"), sizeof(ipc_sockaddr->sun_path) - 1);
+		ipc_sockaddr->sun_path[sizeof(ipc_sockaddr->sun_path) - 1] = 0;
+	}
+
+	unlink(ipc_sockaddr->sun_path);
+	if (bind(ipc_socket, (struct sockaddr *)ipc_sockaddr, sizeof(*ipc_sockaddr)) == -1) {
+		die("Unable to bind IPC socket");
+	}
+
+	if (listen(ipc_socket, 3) == -1) {
+		die("Unable to listen on IPC socket");
+	}
+
+	// Set i3 IPC socket path so that i3-msg works out of the box
+	setenv("I3SOCK", ipc_sockaddr->sun_path, 1);
+	setenv("SWAYSOCK", ipc_sockaddr->sun_path, 1);
+
+	ipc_client_list = create_list();
+
+	ipc_display_destroy.notify = handle_display_destroy;
+	wl_display_add_destroy_listener(dpy, &ipc_display_destroy);
+
+	ipc_event_source = wl_event_loop_add_fd(wl_display_get_event_loop(dpy), ipc_socket,
+			WL_EVENT_READABLE, ipc_handle_connection, NULL);
+}
+
+int ipc_handle_connection(int fd, uint32_t mask, void *data) {
+	int flags;
+	int client_fd;
+	struct ipc_client *client;
+
+	(void) fd;
+	if (!(mask == WL_EVENT_READABLE)) {
+		return 0;
+	}
+
+	client_fd = accept(ipc_socket, NULL, NULL);
+	if (client_fd == -1) {
+		fprintf(stderr, "Unable to accept IPC client connection");
+		return 0;
+	}
+
+	if ((flags = fcntl(client_fd, F_GETFD)) == -1
+			|| fcntl(client_fd, F_SETFD, flags|FD_CLOEXEC) == -1) {
+		fprintf(stderr, "Unable to set CLOEXEC on IPC client socket");
+		close(client_fd);
+		return 0;
+	}
+	if ((flags = fcntl(client_fd, F_GETFL)) == -1
+			|| fcntl(client_fd, F_SETFL, flags|O_NONBLOCK) == -1) {
+		fprintf(stderr, "Unable to set NONBLOCK on IPC client socket");
+		close(client_fd);
+		return 0;
+	}
+
+	client = malloc(sizeof(struct ipc_client));
+	if (!client) {
+		fprintf(stderr, "Unable to allocate ipc client");
+		close(client_fd);
+		return 0;
+	}
+	client->pending_length = 0;
+	client->fd = client_fd;
+	client->subscribed_events = 0;
+	client->event_source = wl_event_loop_add_fd(wl_display_get_event_loop(dpy),
+			client_fd, WL_EVENT_READABLE, ipc_client_handle_readable, client);
+	client->writable_event_source = NULL;
+
+	client->write_buffer_size = 128;
+	client->write_buffer_len = 0;
+	client->write_buffer = malloc(client->write_buffer_size);
+	if (!client->write_buffer) {
+		fprintf(stderr, "Unable to allocate ipc client write buffer");
+		close(client_fd);
+		return 0;
+	}
+
+	list_add(ipc_client_list, client);
+	return 0;
+}
+
+int ipc_client_handle_readable(int client_fd, uint32_t mask, void *data) {
+	int read_available;
+	uint8_t buf[IPC_HEADER_SIZE];
+	ssize_t received;
+	struct ipc_client *client = data;
+
+	if (mask & WL_EVENT_ERROR) {
+		fprintf(stderr, "IPC Client socket error, removing client");
+		ipc_client_disconnect(client);
+		return 0;
+	}
+
+	if (mask & WL_EVENT_HANGUP) {
+		ipc_client_disconnect(client);
+		return 0;
+	}
+
+	if (ioctl(client_fd, FIONREAD, &read_available) == -1) {
+		fprintf(stderr, "Unable to read IPC socket buffer size");
+		ipc_client_disconnect(client);
+		return 0;
+	}
+
+	// Wait for the rest of the command payload in case the header has already been read
+	if (client->pending_length > 0) {
+		if ((uint32_t)read_available >= client->pending_length) {
+			// Reset pending values.
+			uint32_t pending_length = client->pending_length;
+			enum ipc_command_type pending_type = client->pending_type;
+			client->pending_length = 0;
+			ipc_client_handle_command(client, pending_length, pending_type);
+		}
+		return 0;
+	}
+
+	if (read_available < (int) IPC_HEADER_SIZE) {
+		return 0;
+	}
+
+	// Should be fully available, because read_available >= IPC_HEADER_SIZE
+	received = recv(client_fd, buf, IPC_HEADER_SIZE, 0);
+	if (received == -1) {
+		fprintf(stderr, "Unable to receive header from IPC client");
+		ipc_client_disconnect(client);
+		return 0;
+	}
+
+	if (memcmp(buf, ipc_magic, sizeof(ipc_magic)) != 0) {
+		fprintf(stderr, "IPC header check failed");
+		ipc_client_disconnect(client);
+		return 0;
+	}
+
+	memcpy(&client->pending_length, buf + sizeof(ipc_magic), sizeof(uint32_t));
+	memcpy(&client->pending_type, buf + sizeof(ipc_magic) + sizeof(uint32_t), sizeof(uint32_t));
+
+	if (read_available - received >= (long)client->pending_length) {
+		// Reset pending values.
+		uint32_t pending_length = client->pending_length;
+		enum ipc_command_type pending_type = client->pending_type;
+		client->pending_length = 0;
+		ipc_client_handle_command(client, pending_length, pending_type);
+	}
+
+	return 0;
+}
+
+bool ipc_send_reply(struct ipc_client *client, enum ipc_command_type payload_type,
+		const char *payload, uint32_t payload_length) {
+	char data[IPC_HEADER_SIZE];
+	char *new_buffer;
+	if (payload == NULL) {
+		return false;
+	}
+
+
+	memcpy(data, ipc_magic, sizeof(ipc_magic));
+	memcpy(data + sizeof(ipc_magic), &payload_length, sizeof(payload_length));
+	memcpy(data + sizeof(ipc_magic) + sizeof(payload_length), &payload_type, sizeof(payload_type));
+
+	while (client->write_buffer_len + IPC_HEADER_SIZE + payload_length >=
+				 client->write_buffer_size) {
+		client->write_buffer_size *= 2;
+	}
+
+	if (client->write_buffer_size > 4e6) { // 4 MB
+		fprintf(stderr, "Client write buffer too big (%zu), disconnecting client",
+				client->write_buffer_size);
+		ipc_client_disconnect(client);
+		return false;
+	}
+
+	new_buffer = realloc(client->write_buffer, client->write_buffer_size);
+	if (!new_buffer) {
+		fprintf(stderr, "Unable to reallocate ipc client write buffer");
+		ipc_client_disconnect(client);
+		return false;
+	}
+	client->write_buffer = new_buffer;
+
+	memcpy(client->write_buffer + client->write_buffer_len, data, IPC_HEADER_SIZE);
+	client->write_buffer_len += IPC_HEADER_SIZE;
+	memcpy(client->write_buffer + client->write_buffer_len, payload, payload_length);
+	client->write_buffer_len += payload_length;
+
+	if (!client->writable_event_source) {
+		client->writable_event_source = wl_event_loop_add_fd(
+				wl_display_get_event_loop(dpy), client->fd, WL_EVENT_WRITABLE,
+				ipc_client_handle_writable, client);
+	}
+
+	return true;
+}
+
 void
 run(char *startup_cmd)
 {
@@ -1858,6 +2859,7 @@ run(char *startup_cmd)
 	const char *socket = wl_display_add_socket_auto(dpy);
 	if (!socket)
 		die("startup: display_add_socket_auto");
+	ipc_init();
 	setenv("WAYLAND_DISPLAY", socket, 1);
 
 	/* Start the backend. This will enumerate outputs and inputs, become the DRM
@@ -1941,6 +2943,7 @@ setfloating(Client *c, int floating)
 	c->isfloating = floating;
 	wlr_scene_node_reparent(c->scene, layers[c->isfloating ? LyrFloat : LyrTile]);
 	arrange(c->mon);
+	ipc_event_window(c, "floating");
 	printstatus();
 }
 
@@ -1980,6 +2983,7 @@ setfullscreen(Client *c, int fullscreen)
 		}
 	}
 	arrange(c->mon);
+	ipc_event_window(c, "fullscreen_mode");
 	printstatus();
 }
 
@@ -2363,12 +3367,27 @@ toggletag(const Arg *arg)
 void
 toggleview(const Arg *arg)
 {
-	unsigned int newtagset = selmon ? selmon->tagset[selmon->seltags] ^ (arg->ui & TAGMASK) : 0;
-
+	json_object *obj;
+	const char *json_string;
+	unsigned int tag, newtagset;
+	if (ipc_has_event_listeners(IPC_EVENT_WORKSPACE)) {
+		obj = json_object_new_object();
+		json_object_object_add(obj, "change", json_object_new_string("focus"));
+		json_object_object_add(obj, "old", ipc_get_workspaces_callback(i3_tag, selmon));
+	}
+	i3_tag = arg->ui;
+	tag = 1 << arg->ui;
+	newtagset = selmon ? selmon->tagset[selmon->seltags] ^ (tag & TAGMASK) : 0;
 	if (newtagset) {
 		selmon->tagset[selmon->seltags] = newtagset;
 		focusclient(focustop(selmon), 1);
 		arrange(selmon);
+	}
+	if (ipc_has_event_listeners(IPC_EVENT_WORKSPACE)) {
+		json_object_object_add(obj, "current", ipc_get_workspaces_callback(i3_tag, selmon));
+		json_string = json_object_to_json_string(obj);
+		ipc_send_event(json_string, IPC_EVENT_WORKSPACE);
+		json_object_put(obj);
 	}
 	printstatus();
 }
@@ -2471,6 +3490,7 @@ updatetitle(struct wl_listener *listener, void *data)
 	Client *c = wl_container_of(listener, c, set_title);
 	if (c == focustop(c->mon))
 		printstatus();
+	ipc_event_window(c, "title");
 }
 
 void
@@ -2480,21 +3500,193 @@ urgent(struct wl_listener *listener, void *data)
 	Client *c = client_from_wlr_surface(event->surface);
 	if (c && c != selclient()) {
 		c->isurgent = 1;
+		ipc_event_window(c, "urgent");
 		printstatus();
 	}
 }
 
 void
-view(const Arg *arg)
+switchtag(unsigned int tag, Monitor *m)
 {
-	if (!selmon || (arg->ui & TAGMASK) == selmon->tagset[selmon->seltags])
+	json_object *obj;
+	const char *json_string;
+	if (ipc_has_event_listeners(IPC_EVENT_WORKSPACE)) {
+		obj = json_object_new_object();
+		json_object_object_add(obj, "change", json_object_new_string("focus"));
+		json_object_object_add(obj, "old", ipc_get_workspaces_callback(i3_tag, m));
+	}
+	i3_tag = tag;
+	tag = 1 << tag;
+	if ((tag & TAGMASK) == m->tagset[m->seltags])
+		return;
+	m->seltags ^= 1; /* toggle sel tagset */
+	if (tag & TAGMASK)
+		m->tagset[m->seltags] = tag & TAGMASK;
+	focusclient(focustop(m), 1);
+	arrange(m);
+	if (ipc_has_event_listeners(IPC_EVENT_WORKSPACE)) {
+		json_object_object_add(obj, "current", ipc_get_workspaces_callback(i3_tag, selmon));
+		json_string = json_object_to_json_string(obj);
+		ipc_send_event(json_string, IPC_EVENT_WORKSPACE);
+		json_object_put(obj);
+	}
+	printstatus();
+}
+
+void
+viewall(const Arg *arg)
+{
+	json_object *obj;
+	const char *json_string;
+	if (ipc_has_event_listeners(IPC_EVENT_WORKSPACE)) {
+		obj = json_object_new_object();
+		json_object_object_add(obj, "change", json_object_new_string("focus"));
+		json_object_object_add(obj, "old", ipc_get_workspaces_callback(i3_tag, selmon));
+	}
+	i3_tag = 0;
+	if (!selmon || (~0 & TAGMASK) == selmon->tagset[selmon->seltags])
 		return;
 	selmon->seltags ^= 1; /* toggle sel tagset */
-	if (arg->ui & TAGMASK)
-		selmon->tagset[selmon->seltags] = arg->ui & TAGMASK;
+	if (~0 & TAGMASK)
+		selmon->tagset[selmon->seltags] = ~0 & TAGMASK;
 	focusclient(focustop(selmon), 1);
 	arrange(selmon);
+	if (ipc_has_event_listeners(IPC_EVENT_WORKSPACE)) {
+		json_object_object_add(obj, "current", ipc_get_workspaces_callback(i3_tag, selmon));
+		json_string = json_object_to_json_string(obj);
+		ipc_send_event(json_string, IPC_EVENT_WORKSPACE);
+		json_object_put(obj);
+	}
 	printstatus();
+}
+
+struct cmd_results *
+cmd_workspace(int argc, char **argv)
+{
+	struct cmd_results *error = NULL;
+	int output_location = -1;
+	unsigned int i;
+	ssize_t tag;
+	Monitor *m;
+	ssize_t j;
+	char *ws_name;
+	if ((error = checkarg(argc, "workspace", EXPECTED_AT_LEAST, 1))) {
+		return error;
+	}	
+	for (i = 0; i < argc; ++i) {
+		if (strcasecmp(argv[i], "output") == 0) {
+			output_location = i;
+			break;
+		}
+	}
+
+	if (output_location == 0) {
+		return cmd_results_new(CMD_INVALID,
+			"Expected 'workspace <name> output <output>'");
+	} else if (output_location > 0) {
+		if ((error = checkarg(argc, "workspace", EXPECTED_AT_LEAST,
+						output_location + 2))) {
+			return error;
+		}
+		ws_name = join_args(argv, output_location);
+		for (j = 0; j < LENGTH(tags); j++) {
+			if (strcmp(tags[j], ws_name) == 0) {
+				tag = j;
+				break;
+			}
+		}
+		i = output_location + 1;
+		wl_list_for_each(m, &mons, link) {
+			if (i > argc) {
+				break;
+			}
+			if (strcmp(argv[i], m->wlr_output->name) == 0) {
+				switchtag(tag, m);
+			}
+			i++;
+		}
+		free(ws_name);
+	} else {
+		m = selmon;
+		/*
+		if (root->fullscreen_global) {
+			return cmd_results_new(CMD_FAILURE, "workspace",
+				"Can't switch workspaces while fullscreen global");
+		}
+		*/
+
+		/*
+		while (strcasecmp(argv[0], "--no-auto-back-and-forth") == 0) {
+			auto_back_and_forth = false;
+			if ((error = checkarg(--argc, "workspace", EXPECTED_AT_LEAST, 1))) {
+				return error;
+			}
+			++argv;
+		}
+		*/
+
+		if (strcasecmp(argv[0], "number") == 0) {
+			if (argc < 2) {
+				return cmd_results_new(CMD_INVALID,
+						"Expected workspace number");
+			}
+			if (!isdigit(argv[1][0])) {
+				return cmd_results_new(CMD_INVALID,
+						"Invalid workspace number '%s'", argv[1]);
+			}
+			switchtag(atoi(argv[1]), m);
+			/*
+			if (ws && auto_back_and_forth) {
+				ws = workspace_auto_back_and_forth(ws);
+			}
+			*/
+		} /* else if (strcasecmp(argv[0], "next") == 0 ||
+				strcasecmp(argv[0], "prev") == 0 ||
+				strcasecmp(argv[0], "next_on_output") == 0 ||
+				strcasecmp(argv[0], "prev_on_output") == 0 ||
+				strcasecmp(argv[0], "current") == 0) {
+			for (i = 0; i < LENGTH(tags); i++) {
+				if (strcmp(tags[i], argv[0])) {
+					view((Arg*)&i);
+					break;
+				}
+			}
+		
+		}  else if (strcasecmp(argv[0], "back_and_forth") == 0) {
+			if (!seat->prev_workspace_name) {
+				return cmd_results_new(CMD_INVALID,
+						"There is no previous workspace");
+			}
+			for (i = 0; i < LENGTH(tags); i++) {
+				if (strcmp(tags[i], argv[0])) {
+					m->seltags = 1 << (unsigned int)i;
+					break;
+				}
+			}
+		} */ else {
+			char *name = join_args(argv, argc);
+			for (i = 0; i < LENGTH(tags); i++) {
+				if (strcmp(tags[i], name) == 0) {
+					switchtag(i, m);
+					break;
+				}
+			}
+			free(name);
+			/*
+			if (ws && auto_back_and_forth) {
+				ws = workspace_auto_back_and_forth(ws);
+			}
+			*/
+		}
+	}
+	return cmd_results_new(CMD_SUCCESS, NULL);
+}
+
+
+inline void
+view(const Arg *arg)
+{
+	switchtag(arg->ui, selmon);
 }
 
 void
@@ -2572,6 +3764,7 @@ zoom(const Arg *arg)
 	wl_list_remove(&sel->link);
 	wl_list_insert(&clients, &sel->link);
 
+	ipc_event_window(sel, "move");
 	focusclient(sel, 1);
 	arrange(selmon);
 }
