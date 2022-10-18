@@ -9,15 +9,17 @@ DWLDEVCFLAGS = -pedantic -Wall -Wextra -Wdeclaration-after-statement -Wno-unused
 	-Werror=strict-prototypes -Werror=implicit -Werror=return-type -Werror=incompatible-pointer-types
 
 # CFLAGS / LDFLAGS
-PKGS      = wlroots wayland-server xkbcommon libinput $(XLIBS)
+PKGS      = wlroots wayland-server xkbcommon libinput json-c $(XLIBS)
 DWLCFLAGS = `$(PKG_CONFIG) --cflags $(PKGS)` $(DWLCPPFLAGS) $(DWLDEVCFLAGS) $(CFLAGS)
 LDLIBS    = `$(PKG_CONFIG) --libs $(PKGS)` $(LIBS)
 
 all: dwl
-dwl: dwl.o util.o
-	$(CC) dwl.o util.o $(LDLIBS) $(LDFLAGS) $(DWLCFLAGS) -o $@
+dwl: dwl.o util.o list.o stringop.o
+	$(CC) dwl.o util.o list.o stringop.o $(LDLIBS) $(LDFLAGS) $(DWLCFLAGS) -o $@
 dwl.o: dwl.c config.mk config.h client.h xdg-shell-protocol.h wlr-layer-shell-unstable-v1-protocol.h
 util.o: util.c util.h
+list.o: list.c list.h
+stringop.o: stringop.c stringop.h
 
 # wayland-scanner is a tool which generates C headers and rigging for Wayland
 # protocols, which are specified in XML. wlroots requires you to rig these up
